@@ -1,0 +1,300 @@
+---
+title: "Part C"
+author: "Cathy Wang"
+date: "20/03/2020"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,eval=FALSE}
+library(readr)
+library(dplyr)
+library(stm)
+library(udpipe)
+library(data.table)
+```
+
+#Data Preparation
+```{r eval=FALSE}
+library(RSQLite)
+conn <- dbConnect(RSQLite::SQLite(), "inside_airbnb.db/inside_airbnb.db")
+
+review <- dbGetQuery(conn,"SELECT * FROM review
+                           WHERE file_name = 'amsterdam_reviews.csv.gz'")
+comments_clean <- dbGetQuery(conn,"SELECT comments_cleaned.annotated_comments_partc,comments_cleaned.review_id FROM comments_cleaned")
+review <- review %>% left_join(comments_clean)
+                           
+listing <- dbGetQuery(conn,"SELECT review_scores_rating,price,listing_id
+                           FROM listing
+                           WHERE file_name = 'amsterdam_listings.csv.gz'")
+mel_for_stm <- listing %>% left_join(review) %>% na.omit()
+dbDisconnect(conn)
+
+#In order to speed the process, we decide to use sample
+set.seed(10)
+mel_for_stm <- mel_for_stm %>% sample_frac(0.4) %>% na.omit()
+```
+
+
+```{r eval=FALSE}
+to_remove_listing_ids <- mel_for_stm %>% group_by(listing_id) %>% summarise(total=n()) %>% filter(total <= 5) %>% pull(listing_id)
+
+mel_for_stm <- mel_for_stm %>% filter(!(listing_id %in% to_remove_listing_ids))
+```
+
+# Text Processing
+```{r eval=FALSE}
+#-----Text Processing - removing customstopwords
+processed <- textProcessor(mel_for_stm$annotated_comments_partc,
+                           metadata = mel_for_stm,
+                           customstopwords = c("airbnb","apartment","melbourne","house","thanks","thing","flat","welcome","lot","place","end","bit","plenty","one","part","stay","accommodation","front","coo","cross","don","didn","fitzroy","victoria","couldn"),
+                           stem = F)
+
+#Checking words without specific meaning and treating them as stopwords
+#processed$vocab
+
+#-----Removing missing value in the prevalence covariates. In the process of topic modelling ,missing value in the prevalence covariates can not be existed as well. 
+
+nrow(processed$meta)
+nrow(processed$meta) - sum(is.na(processed$meta$review_scores_rating))
+nrow(processed$meta) - sum(is.na(processed$meta$price)) # The results show that there are some missing value in the price.
+
+#keep_price <- !is.na(processed$meta$price) # Detecting missing value
+#meta <- processed$meta[keep_price,] # Keeping only obeserved values in meta and docs
+#docs <- processed$documents[keep_price]
+
+#-----Generalising prepDocuments for stm
+threshold <- round(1/100 * length(processed$documents),0) 
+out <- prepDocuments(processed$documents,
+                     processed$vocab,
+                     processed$meta,
+                     lower.thresh = threshold)
+#save(out,file = "out.rda")
+```
+
+# Run the model to get topics
+```{r eval=FALSE}
+library(geometry)
+set.seed(123)
+airbnbfit <- stm(documents = out$documents,
+                   vocab = out$vocab,
+                   # Specifying the topic numbers
+                   #K=0,
+                   K = 30,
+                   prevalence =~ price+review_scores_rating,
+                   max.em.its = 75, 
+                   data = out$meta,
+                   reportevery=5,
+                   # gamma.prior = "L1",
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+save(airbnbfit,file = "airbnbfit_mel.rda")
+summary(airbnbfit)
+```
+
+# TOpic labels and Proportion table
+```{r eval=FALSE}
+topic_labels <- c("Location to CBD","Distance to tram",
+                  "Attraction","Views","Shops",
+                  "Experience",
+                  "Breakfast","Topic 8","Topic 9",
+                  "Restaurants","Pool",
+                  "Bathroom",
+                  "Amenity",
+                  "Availability for people","Location to airport",
+                  "Night",
+                  "Rooms","Drinks",
+                "Topic 19","Cafe","Host","Beach","Privacy","Arrival","Design","Location to centre","Parking","Shopping","Shower","Instruction provided by host")
+
+#-----Summarising the proportions of each topics based on theta
+
+topic_proportions <- colMeans(airbnbfit$theta)
+topic_summary <- summary(airbnbfit)
+convergence <- as.data.frame(airbnbfit$theta)
+
+colnames(convergence) <- topic_labels
+table_towrite_labels <- data.frame()
+for(i in 1:length(topic_summary$topicnums)){
+
+   row_here <- tibble(topicnum= topic_summary$topicnums[i],
+                      topic_label = topic_labels[i],
+                      proportion = 100*round(topic_proportions[i],4),
+                     frex_words = paste(topic_summary$frex[i,1:3],
+                                        collapse = ", "))
+   table_towrite_labels <- rbind(row_here,table_towrite_labels)
+}
+table_towrite_labels %>% arrange(topicnum)
+```
+
+# STM solutions 
+```{r eval=FALSE}
+quality <- topicQuality(airbnbfit,documents = out$documents)
+
+stm_solutions <- plot(airbnbfit,custom.labels = topic_labels,main = "")
+#save.image(stm_solutions,file = "Topic 30.img")
+```
+
+
+#Estimate effects of variables price and review scores ratings on topics
+```{r eval=FALSE}
+effects <- estimateEffect(~review_scores_rating+price,
+                          stmobj = airbnbfit,
+                          metadata = out$meta)
+```
+
+
+```{r eval=FALSE}
+#-----Ploting results of effects - review_score_rating
+plot(effects, covariate = "review_scores_rating",
+     topics = c(1:30),
+     model = airbnbfit, method = "difference",
+     cov.value1 = "100", cov.value2 = "0",
+     xlab = "Low Rating ... High Rating",
+     xlim = c(-0.004,0.004),
+     main = "Marginal change on topic probabilities for low and high review scores rating",
+     custom.labels = topic_labels,
+     labeltype = "custom") 
+
+```
+
+
+
+```{r eval=FALSE}
+#-----Ploting the result if effects - price. Becasue price is continuous variable, we plot the result for each topic
+for(i in 1:length(topic_labels)){
+plot(effects, covariate = "price",
+     topics = i,
+     model = airbnbfit, method = "continuous",
+     # For this plotting we get the uper quantile
+     # and low quantile of the price 
+     xlab = "Price",
+     xlim = c(0,500),
+     main = topic_labels[i],
+     printlegend = FALSE,
+     custom.labels =topic_labels[i],
+     labeltype = "custom")
+}
+
+margin1 <- as.numeric(quantile(out$meta$price)[2])
+margin2 <- as.numeric(quantile(out$meta$price)[4])
+
+plot(effects, covariate = "price",
+     topics = c(1:30),
+     model = airbnbfit, method = "difference",
+     cov.value1 = margin2, cov.value2 = margin1,
+     xlab = "Low Price ... High Price",
+     xlim = c(-0.004,0.004),
+     main = "Marginal change on topic probabilities for low and high price",
+     custom.labels =topic_labels,
+     labeltype = "custom")
+```
+
+
+#Combine with calendar file
+```{r eval=FALSE}
+#In this part, we will use the avgerage price from the calendar file. The calculation has already done in part b.
+
+load("~/group_TA/average_price.rda")
+
+for_regression <- cbind(out$meta,convergence) %>% na.omit()
+for_regression$price <- as.numeric(for_regression$price)
+
+#-----Combinig with calendar file in order to get average price per month
+final_df_monthly <- final_df_monthly %>% select(listing_id,monthly_average_price,year_month.x) %>%
+group_by(listing_id,year_month.x)%>%
+  summarise(avg_price=mean(monthly_average_price))
+
+for_regression <- for_regression %>% select(review_scores_rating,listing_id,review_id,review_date,topic_labels)
+
+for_regression <- left_join(for_regression,final_df_monthly) %>% na.omit()
+
+
+#-----Converting the date object to the month year format 
+for_regression$month_year <- format(as.Date(for_regression$review_date),"%Y-%m")
+```
+
+
+#Create dataset for regression model
+```{r eval=FALSE}
+#-----Creating topic summary 
+library(ggplot2)
+
+regress_stm_topics <- for_regression %>% group_by(month_year,listing_id) %>%
+      summarise_at(vars(topic_labels),mean,) %>% na.omit()
+colnames <- paste0("mean_",topic_labels)
+
+names(regress_stm_topics)[3:32]<- colnames
+
+#-----Creating Sumaries of price and review score ratings
+for_regression %>% group_by(month_year,listing_id)%>% 
+        summarise(avg_price= mean(avg_price),review_scores_rating= mean(review_scores_rating)) -> regress_stm_scores_price
+
+#-----Generating final file
+regression_stm_all <- bind_cols(regress_stm_scores_price,regress_stm_topics)
+rm(regress_stm_scores_price)
+rm(regress_stm_topics)
+regression_stm_all <-regression_stm_all[,-c(5:6)]
+```
+
+```{r eval=FALSE}
+
+#-----Exploring the effect of all of topics on price and review scores rating 
+#Price
+summary(lm(avg_price~.,data = regression_stm_all[3:34]))
+
+price_summary <- summary(lm(avg_price~.,data = regression_stm_all[3:34]))
+estimation_price <- as.data.frame(price_summary$coefficients)
+estimation_price$topics <- c("Rooms","Review_scores_rating",topic_labels[1:29])
+rm(price_summary)
+
+#Review score rating
+summary(lm(review_scores_rating~.,data = regression_stm_all[3:34]))
+
+review_summary <- summary(lm(review_scores_rating~.,data = regression_stm_all[3:34]))
+estimation_review <- as.data.frame(review_summary$coefficients)
+estimation_review$topics <- c("Rooms","Avg_Price",topic_labels[1:29])
+rm(review_summary)
+
+```
+
+
+#Effects of some topics on review scores rating
+```{r eval=FALSE}
+#Based on the result of the estimated effects, we find review scores have influence on topic 3,13,8,26. we will check the effects of these topics on review scores.
+
+model1_review_score <- lm(review_scores_rating~mean_Bathroom+avg_price,data=regression_stm_all)
+model2_review_score <- lm(review_scores_rating~mean_Luggage+avg_price,data=regression_stm_all)
+model3_review_score <- lm(review_scores_rating~mean_Fridge+avg_price,data=regression_stm_all)
+model4_review_score <- lm(review_scores_rating~mean_Grocery+avg_price,data=regression_stm_all)
+stargazer::stargazer(model1_review_score,model2_review_score,
+                     model3_review_score,model4_review_score,
+                     type = "text")
+```
+
+```{r eval=FALSE}
+#Effects of some topics on price
+
+#Based on the result of the estimated effects, we find price have influence on topic 22,15,18,11. we will check the effects of these topics on price.
+
+model1_price <- lm(avg_price~mean_View+review_scores_rating,data=regression_stm_all)
+
+model2_price <- 
+  lm(avg_price~`mean_Transportation-tram and ferry`+review_scores_rating,data=regression_stm_all)
+
+model3_price <- 
+  lm(avg_price~`mean_Transportation - bus`+review_scores_rating,data=regression_stm_all)
+
+model4_price <- 
+  lm(avg_price~`mean_Topic 15`+review_scores_rating,data=regression_stm_all)
+stargazer::stargazer(model1_price,model2_price,
+                     model3_price,model4_price,
+                     type = "text")
+
+```
+```
+

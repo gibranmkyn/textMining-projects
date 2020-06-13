@@ -1,0 +1,573 @@
+---
+title: "text_partB"
+author: "Gibran Makyanie"
+date: "08/03/2020"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+```{r, message=FALSE}
+rm(list = ls())
+library(RSQLite)
+library(tm)
+library(ggplot2)
+library(gridExtra)
+library(stm)
+library(quanteda)
+library(textfeatures)
+library(sentimentr)
+library(qdap)
+library(lubridate)
+library(stargazer)
+library(readr)
+library(stringr)
+library(dplyr)
+library(tidyr)
+```
+
+
+Sources: 
+https://cran.r-project.org/web/packages/textfeatures/textfeatures.pdf
+https://datascienceplus.com/automated-text-feature-engineering-using-textfeatures-in-r/
+
+```{r}
+start <- Sys.time()
+```
+
+# Importing Data
+
+```{r}
+set.seed(10)
+t1 <- Sys.time()
+
+# ----- Data Importing
+conn <- dbConnect(RSQLite::SQLite(), "dataset/inside_airbnb.db")
+
+# ----- Get list of cities (markets) to run analyse and for loop for every city
+city <- dbGetQuery(conn, 'SELECT distinct(market) FROM listing')
+city <- city$market
+
+# ----- Select listings
+listing_sample <- dbGetQuery(conn, paste0('SELECT listing.*, annotated_description FROM listing
+           LEFT JOIN description_udpipe ON listing.listing_id = description_udpipe.listing_id
+           WHERE market = "',city[1], '" limit 1'))
+
+  
+listing_sample <- listing_sample[, !duplicated(colnames(listing_sample))] %>%
+  mutate(security_deposit = as.numeric(gsub(",", "", substring(security_deposit, 2)))) %>%
+  mutate(cleaning_fee = as.numeric(gsub(",", "", substring(cleaning_fee, 2)))) %>%
+  mutate(extra_people = as.numeric(gsub(",", "", substring(extra_people, 2)))) %>%
+  sample_frac(0.40)
+  
+  
+# ----- Select owners of the listings
+host_distinct <- unique(listing_sample$host_id)
+host_sample <- dbGetQuery(conn, paste('SELECT host_id, host_name FROM host WHERE host_id IN(', paste(host_distinct, collapse = ","), ')'))  %>% 
+  distinct(host_id, host_name)
+
+
+# ----- Select reviews of the listings
+listing_distinct <- listing_sample %>%  distinct(listing_id)
+
+review_sample <- dbGetQuery(conn,paste('
+                        SELECT listing_id, review.review_id, review_date, comments, comments_semi_cleaned, annotated_comments_partb, file_name 
+                        FROM review LEFT JOIN comments_cleaned ON review.review_id = comments_cleaned.review_id WHERE listing_id IN', substring(paste(listing_distinct,collapse = ","),2))) %>%
+  mutate(review_date = as.Date(review_date))
+
+# ----- Select calendar of the listings
+calendar <- dbGetQuery(conn, paste('SELECT * FROM calendar WHERE listing_id IN', substring(paste(listing_distinct,collapse = ","),2)))
+save(calendar, file = 'temp/calendar.rda')
+rm(listing_distinct)
+rm(host_distinct)
+
+dbDisconnect(conn)
+
+t2 <- Sys.time()
+t2-t1
+
+```
+
+
+# Exploratory Data Analysis
+
+
+## Understanding Reviews Growth
+```{r}
+reviewsNum <- review_sample %>% group_by(review_date) %>% summarise(number = n())
+
+ggplot(reviewsNum, aes(review_date, number)) +
+           geom_point(na.rm=TRUE, color = "#007A87", alpha=0.5) + geom_smooth(color = "#FF5A5F")+
+  ggtitle(paste("How popular is Airbnb in", city[1], "?"),
+          subtitle = "Number of Reviews across years") +
+  labs(x = "Year", y = "Unique listings recieving reviews") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey35")) +
+  theme(plot.caption = element_text(color = "grey68"))
+
+rm(reviewsNum)
+```
+
+## Understanding Price 
+```{r}
+load(file = 'temp/calendar.rda')
+
+groupedCalendarAll <- calendar %>%
+  group_by(bookingdate) %>% 
+  summarise(average_price = mean(price, na.rm = TRUE)) %>% 
+  mutate(year = as.factor(as.character(year(bookingdate))))
+
+# ----- Trend in Listing Price
+ggplot(groupedCalendarAll, aes(x = month(bookingdate), y=average_price)) +
+           geom_point(na.rm=TRUE, alpha=0.5, color = "#007A87") + geom_smooth(color = "#FF5A5F")+ facet_grid(~year)+
+  ggtitle(paste("Trend of Airbnb Listing Prices in", city[1]) ,
+          subtitle = "Average listing price across Months") +
+  labs(x = "Month", y = "Average price across Listings") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey35")) +
+  scale_x_continuous(breaks = c(3, 6, 9, 12))
+
+rm(groupedCalendarAll)
+```
+
+## Understanding Occupancy Rate
+```{r}
+airbnb_occ_rate <- calendar %>% 
+  group_by(bookingdate) %>% 
+  summarise(totalBooked = sum(booked, na.rm = TRUE), totalListings = n()) %>% 
+  mutate(percent_booked = (totalBooked/totalListings)*100) %>%
+  mutate(year = year(bookingdate))
+
+ggplot(airbnb_occ_rate, aes(x = month(bookingdate), y = percent_booked)) +
+  geom_jitter(na.rm=TRUE, alpha=0.5, color = "#007A87") +
+  geom_smooth(color = "#FF5A5F") +
+  facet_grid(~year) +
+  ggtitle(paste("Occupancy Rate Overtime in", city[1])) +
+  labs(x = "Month", y = "Occupancy Rate") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey35")) +
+  scale_x_continuous(breaks = c(3, 6, 9, 12))
+
+rm(airbnb_occ_rate)
+
+```
+
+# Feature Extraction
+
+There are many data points made public by airbnb on reviews textual data and listing descriptions. Review dataset only contains textual comments with the date of the review and to which listing was the review made for. While the listing dataset has an extensive number of structured features. This section focuses on extracting as many useful text features as possible both from listings and reviews data, which then later be used to build predictive models.
+
+
+## Feature Extraction from reviews
+
+One of the most important feature we could extract from customer reviews are the sentiment scores, as they will vary a lot per experience of a customer at a particular airbnb listing. Instead of using `tidyr` approach of sentiment tokenisiation, `textfeatures` package covers some of the most common text feature extraction. Additionally, the package is run on top of `text2vec`, which is a fast and memory-friendly text vectorization package that is going to be used later in listing feature extractions. 
+
+Sentiments scores extracted includes affin, syuzhet, bing, and vader. After investigating the github repository (https://github.com/mkearney/textfeatures), we found out that the approach follows the same logic of tidyr sentiment analysis where the words are tokenised in the back-end and then scored. Thus, we beleive getting sentiment from this approach is valid. As a bonus, generic features such as n_char, lower_cases, uppercases, commas, periods, line breaks are also extracted. In addition to the bag of word approach on sentiment scoring, we added `sentimentr` that attempts to take into account valence shifters (i.e.,negators, amplifiers (intensifiers), de-amplifiers (downtoners), and adversative conjunctions) while maintaining speed.
+
+```{r}
+t1 <- Sys.time()
+
+# ----- Get features from uncleaned comments
+features <- textfeatures(review_sample$comments, normalize = FALSE, word_dims = FALSE, sentiment = TRUE)
+
+# ----- Get sentiment from cleaned comments with sentimentr package
+text <- get_sentences(review_sample$annotated_comments_partb) #changeee-partbcleaned
+review_sample$sentimentr <- as.data.frame(sentiment_by(text))$ave_sentiment
+
+# ----- Whether host name is mentioned in the comments
+review_sample <- review_sample %>%
+  left_join(listing_sample %>% select(listing_id, host_id)) %>% 
+  left_join(host_sample %>% distinct(host_id, host_name)) %>%
+  mutate(host_mentioned = as.numeric(grepl(host_name,comments, ignore.case = TRUE)))
+
+# ----- DF about comments features
+review_features <-  bind_cols(review_sample, features)
+
+save(review_features, file = 'temp/review_features.rda')
+rm(text)
+rm(features)
+rm(host_sample)
+
+# ----- Aggregate the features from review accordingly
+review_features_agg <- review_features %>%
+  select(-c(host_name)) %>%
+  group_by(listing_id, file_name) %>%
+  summarise_if(is.numeric, mean, na.rm = TRUE)
+save(review_features_agg, file = 'temp/review_features_agg.rda')
+rm(review_features_agg)
+
+review_sentiment_monthly <- review_features %>%
+  mutate(year_month =  format(review_date,"%Y-%m"), year_month_back = format(review_date - years(1), "%Y-%m")) %>%
+  select(-c(host_name)) %>%
+  group_by(listing_id, file_name, year_month, year_month_back) %>%
+  summarise_if(is.numeric, mean, na.rm = TRUE) %>%
+  select(listing_id, year_month, file_name, year_month_back, year_month_back, sent_afinn, sent_bing, sent_syuzhet, sent_vader, sentimentr)
+
+save(review_sentiment_monthly,file = "temp/review_sentiment_monthly.rda")
+rm(review_sentiment_monthly, review_features, review_sample)
+
+t2 <- Sys.time()
+t2 - t1 
+```
+
+## Feature Extraction from listing data
+
+In contrast to listing data, it is assumed that the description of the listing do not change over period as only the latest listing description were considered. Additionally, scoring a sentiment on a listing's description would not be ideal either since hosts are always going to tell positive sentiment about their properties given their position as listing owner. Therefore, other ways to extract features from listing textual descriptions has to be conducted.
+
+The Term Document Frequency - Inverse Document Frequency (TF-IDF), a technique to quantify a term in a documents wheras a weight is computed and assigned to each term-document. A TF-IDF is highest when a term occurs many times within a small range of documents. Thus help discriminating between documents. In contrast, TF-IDF is lowest when a term occurs frequently in all documents. This measure was known to be a good base case for classifying spam texts. We decided to exploit such characterstics to extract features to use as inputs for regression models later in the chapter. 
+
+To be able to build TF-IDF feature matrix, first a Document-Term Matrix (DTM) has to be built on vocabs of the cleaned and lemmatised textual description column, where only nouns are used. The decision to keep only nouns is driven by the assumption that having some specific words might increase or decrease the value of a lisitng such as price. For instance, a listing which might have the word 'view' or 'swimming pool' is expected to charge more for such luxury. And mostly, nouns as part-of-speech can capture exactly that. Afterwards, the DTM is transformed to TF-IDF matrix with the function in `text2vec` package. Finally, the TF-IDF features are merged with the listing dataset as extension to the available structured listing data.
+
+```{r}
+library(text2vec)
+
+t1 <- Sys.time()
+
+# ----- define preprocessing function and tokenization function
+prep_fun <- tolower
+tok_fun <- word_tokenizer
+term_min <- round(length(listing_sample$annotated_description)*0.01) 
+# term_max <- round(length(listing_sample$new_description_cleaned)*0.1) 
+
+# ----- Initiate tokeniser
+it_train <- itoken(listing_sample$annotated_description, 
+             preprocessor = prep_fun, 
+             tokenizer = tok_fun, 
+             ids = listing_sample$listing_id, 
+             progressbar = TRUE)
+
+# ----- Building vocabularies for document term matrix
+vocab <- create_vocabulary(it_train) #  ngram = c(1L, 2L)
+pruned_vocab <- prune_vocabulary(vocab, 
+                                 # doc_count_min = doc_min,
+                                 term_count_min = term_min, 
+                                 # term_count_max = term_max,
+                                 doc_proportion_max = 0.5,
+                                 doc_proportion_min = 0.001)
+rm(vocab)
+rm(term_min)
+
+# ----- Define how to ransform list of tokens into vector space to build dtm
+vectorizer <- vocab_vectorizer(pruned_vocab)
+rm(pruned_vocab)
+
+# ----- Build DTM
+dtm_train  <- create_dtm(it_train, vectorizer)
+rm(it_train)
+
+# ----- Build weighted TF-IDF matrix
+tfidf <- TfIdf$new() # initiate instance
+dtm_train_tfidf <- fit_transform(dtm_train, tfidf)
+
+rm(tfidf)
+rm(dtm_train)
+
+tf_idf_dataframe <- as.data.frame(as.matrix(dtm_train_tfidf))
+rm(dtm_train_tfidf)
+
+colnames(tf_idf_dataframe) <- paste0(colnames(tf_idf_dataframe), ("_word__"))
+tf_idf_dataframe$listing_id <- substring(rownames(tf_idf_dataframe), 2)
+
+# ----- Finalise Listing Features
+listing_features <- listing_sample %>%
+  inner_join(tf_idf_dataframe, by = 'listing_id')
+
+save(listing_features,file = "temp/listing_features.rda")
+save(tf_idf_dataframe,file = "temp/tf_idf_dataframe.rda")
+rm(listing_features, tf_idf_dataframe)
+
+load(file = 'temp/tf_idf_dataframe.rda')
+
+tf_idf_dataframe
+t2 <- Sys.time()
+t2 - t1
+```
+
+
+## Feature Extraction from calendar
+
+There will be two types of aggregation types will be used in further analysis; aggregation by listing, and aggregation by listing and year-month. 
+
+```{r}
+load(file = 'temp/calendar.rda')
+load(file = 'temp/listing_features.rda')
+
+# ----- Generate aggregated calendar features per listing
+calendar_features_perlisting <- calendar %>%
+  mutate(bookingdate = as.Date(bookingdate), year_month =  format(bookingdate,"%Y-%m")) %>%
+  filter(year(bookingdate) %in% c('2017','2018','2019')) %>%
+  group_by(listing_id) %>%
+  summarise(total_booked = sum(booked, na.rm = TRUE), total_dates = n(), average_price = mean(price, na.rm = TRUE)) %>%
+  left_join(listing_features %>% dplyr::select(listing_id, price), by = 'listing_id') %>%
+  mutate(average_price = ifelse(is.nan(average_price), price, average_price)) %>%
+  mutate(occupancy_rate = (total_booked/total_dates)*100) %>%
+  dplyr::select(-c(total_booked, total_dates, price))
+
+save(calendar_features_perlisting, file = 'temp/calendar_features_perlisting.rda')
+rm(calendar_features_perlisting)
+
+# ----- Generate aggregated calendar features per listing per month
+calendar_features_monthly <- calendar %>%
+  mutate(bookingdate = as.Date(bookingdate), year_month =  format(bookingdate,"%Y-%m")) %>%
+  filter(year(bookingdate) %in% c('2017','2018','2019')) %>%
+  group_by(listing_id, year_month) %>%
+  summarise(total_booked = sum(booked, na.rm = TRUE), total_dates = n(), monthly_average_price = mean(price, na.rm = TRUE)) %>%
+  left_join(listing_features %>% dplyr::select(listing_id, price), by = 'listing_id') %>%
+  mutate(monthly_average_price = ifelse(is.nan(monthly_average_price), price, monthly_average_price)) %>%
+  mutate(monthly_occupancy_rate = (total_booked/total_dates)*100) %>%
+  dplyr::select(-c(total_booked, total_dates, price))
+
+save(calendar_features_monthly, file = 'temp/calendar_features_monthly.rda')
+rm(calendar_features_monthly, calendar)
+
+```
+
+## Final dataframe
+```{r}
+# ----- Final DF per Listing
+load(file='temp/calendar_features_perlisting.rda')
+load(file = 'temp/review_features_agg.rda')
+load(file = 'temp/listing_features.rda')
+
+final_df_perlisting <- calendar_features_perlisting %>%
+  inner_join(listing_features, by = 'listing_id') %>%
+  inner_join(review_features_agg, by = 'listing_id')
+
+save(final_df_perlisting, file = 'temp/final_df_perlisting.rda')
+rm(calendar_features_perlisting, final_df_perlisting)
+
+# ----- Final DF per Listing per year-month
+load(file = 'temp/calendar_features_monthly.rda')
+load(file = 'temp/review_sentiment_monthly.rda')
+
+final_df_monthly <- calendar_features_monthly %>%
+  inner_join(review_sentiment_monthly, by = 'listing_id')
+
+
+save(final_df_monthly, file = 'temp/final_df_monthly.rda')
+rm(calendar_features_monthly, review_features_agg, listing_features, final_df_monthly, review_sentiment_monthly)
+```
+
+
+# How does different features of text review affect the sentiment score of a review?
+## Attempt to create additional feature based on asssumption
+```{r}
+
+
+load(file = 'temp/review_features.rda')
+
+# ----- Exaggeration Sentiment: Create our own sentiment on the assumption that double or more exclamation marks mean the reviewer is more satisfied and double or more question marks mean the reviewer has more doubt to the listing or the service
+
+creative_measures <- review_features %>%    
+select(review_id, comments_semi_cleaned) %>%  
+mutate(exclamation_2 = str_detect(comments_semi_cleaned, fixed("!!")),
+       exclamation_3 = str_detect(comments_semi_cleaned, fixed("!!!")),
+       exclamation_4 = str_detect(comments_semi_cleaned, fixed("!!!!")),
+       question_2 = str_detect(comments_semi_cleaned, fixed("??")),
+       question_3 = str_detect(comments_semi_cleaned, fixed("???")),
+       question_4 = str_detect(comments_semi_cleaned, fixed("????")),
+       exclamation_sent = exclamation_2 + exclamation_3 +exclamation_4,
+       question_sent = question_2 + question_3 + question_4,
+       sent_exaggeration = exclamation_sent - question_sent) %>%
+select(review_id, comments_semi_cleaned, sent_exaggeration)
+
+
+
+# ----- Capslock Sentiment: we assumed that the presence of all-capitalized words in airbnb's comments is more a sign of customer satisfaction, rather than a sign that customers are yelling
+
+creative_measures <- creative_measures %>%
+  mutate(comments_semi_cleaned = removePunctuation(comments_semi_cleaned))
+
+capwords <- unlist(regmatches(creative_measures$comments_semi_cleaned, gregexpr("(?<!\\S)(?:(?=\\S*\\p{L})(?=\\S*\\d)\\S+|(?:\\S*\\p{Lu}){3}\\S*)", creative_measures$comments_semi_cleaned, perl=TRUE))) # List words in the comments that consist of more than 3 uppercase letters
+
+
+capwords <- unique(capwords)
+capwords <- capwords[-matches(vars = capwords, "airb|bnb|rai|ndsm|ams|eur|kfc|dvd|bbq|atm|gps|fyi|usa|nyc|wifi|cbd|usb", ignore.case = TRUE)] # Manually remove some capital stopwords
+
+creative_measures <- 
+  creative_measures %>%
+  mutate(caps = sapply(stringi::stri_extract_all_regex(str = creative_measures$comments_semi_cleaned, pattern = paste(capwords, collapse = "|")), toString), sent_capslock = ifelse(caps == "NA", 0, 1)) %>%
+  select(-c(comments_semi_cleaned, caps))
+
+
+```
+
+```{r}
+load(file= 'temp/review_features.rda')
+
+hist(review_features$n_chars, breaks = 200)
+hist(review_features$n_polite, breaks = 200)
+
+model_data <- review_features %>%
+  left_join(creative_measures, by = 'review_id') %>%
+  select(n_chars, n_polite, sentimentr, host_mentioned, n_periods, sent_exaggeration, sent_capslock)
+
+sentimentr_model_features <- lm(sentimentr ~n_chars + n_polite + host_mentioned + n_periods + sent_exaggeration + sent_capslock, data=model_data)
+summary(sentimentr_model_features)
+
+rm(sentimentr_model_features)
+```
+
+
+# Which sentiment measure predicts a listing's average rating better?
+```{r}
+load(file = 'temp/review_features_agg.rda')
+load(file= "temp/listing_features.rda")
+
+# ----- Look into distribution of sentiments
+hist(review_features_agg$sentimentr, breaks = 200)
+hist(review_features_agg$sent_bing, breaks = 200)
+hist(review_features_agg$sent_afinn, breaks = 200)
+hist(review_features_agg$sent_syuzhet, breaks = 200)
+hist(review_features_agg$sent_vader, breaks = 200)
+
+rating_model_data <- review_features_agg %>% left_join(listing_features %>% select(listing_id, review_scores_rating), by = 'listing_id')
+rm(review_features_agg, listing_features)
+
+# ----- Build sentiment models
+rating_model_sentimentr <- lm(log(review_scores_rating)~lag(sentimentr), data=rating_model_data)
+rating_model_sent_bing <- lm(log(review_scores_rating)~lag(sent_bing), data=rating_model_data)
+rating_model_sent_afinn <- lm(log(review_scores_rating)~lag(sent_afinn), data=rating_model_data)
+rating_model_sent_syuzhet <- lm(log(review_scores_rating)~lag(sent_syuzhet), data=rating_model_data)
+rating_model_sent_vader <- lm(log(review_scores_rating)~lag(sent_vader), data=rating_model_data)
+
+
+# ----- Compare models
+stargazer::stargazer(rating_model_sentimentr,rating_model_sent_bing,rating_model_sent_afinn,rating_model_sent_vader,type = "text")
+
+rm(rating_model_data, rating_model_sentimentr, rating_model_sent_bing, rating_model_sent_afinn, rating_model_sent_syuzhet, rating_model_sent_vader)
+
+```
+
+# How good sentiment on predicting average monthly price of a listing?
+```{r}
+load(file = 'temp/final_df_monthly.rda')
+
+# Bing Liu
+price_model_bingliu <- lm(log(monthly_average_price)~lag(sentimentr), 
+             data=final_df_monthly)
+
+# Afinn
+price_model_affin <- lm(log(monthly_average_price)~lag(sent_afinn), 
+             data=final_df_monthly)
+# Syuzhet 
+price_model_syuzhet <- lm(log(monthly_average_price)~lag(sent_syuzhet), 
+             data=final_df_monthly)
+
+# Vader
+price_model_vader <- lm(log(monthly_average_price)~lag(sent_vader), 
+             data=final_df_monthly)
+
+stargazer::stargazer(price_model_bingliu,price_model_affin,price_model_syuzhet,price_model_vader,type = "text")
+
+rm(price_model_bingliu, price_model_affin,price_model_syuzhet,price_model_vader)
+```
+
+
+
+# Predicting Price and Occupancy Rate using a Listing's information
+## Price Model without TF-IDF Matrix as features
+
+```{r}
+remove_columns <- c('listing_id', 'last_scraped', 'name', 'new_description', 'transit', 'host_id.x','city', 'neighbourhood_group_cleansed','state','zipcode','country_code', 'country','amenities','calendar_last_scraped','first_review', 'file_name.y', 'price','pre_processed.x', 'pre_processed.y','file_name.x','lang','market', 'neighbourhood_cleansed', 'new_description_cleaned','host_id.y','pre_processed','n_urls', 'availability_365', 'availability_90', 'availability_60', 'availability_30')
+
+load(file = 'temp/final_df_perlisting.rda')
+load('temp/tf_idf_dataframe.rda')
+
+# ----- Data Prep for the plot
+data_without_tfidfmatrix <- final_df_perlisting %>%
+  ungroup() %>%
+  filter(average_price != 0) %>%
+  select_if(!names(.) %in% remove_columns) %>% 
+  select_if(!names(.) %in% names(tf_idf_dataframe)) %>%
+  select_if(is.numeric)
+
+data_without_tfidfmatrix <- data_without_tfidfmatrix[,colSums(is.na(data_without_tfidfmatrix))<nrow(data_without_tfidfmatrix)] # remove NA columns
+
+rm(tf_idf_dataframe)
+
+price_base_model <- lm(log(average_price)~., data = data_without_tfidfmatrix)
+occupancy_base_model <- lm(occupancy_rate~., data = data_without_tfidfmatrix)
+
+summary(price_base_model)
+
+rm(data_without_tfidfmatrix)
+```
+
+## Price Model with TF-IDF Matrix as features
+
+```{r}
+data_with_tfidfmatrix <- final_df_perlisting %>%
+  filter(average_price != 0) %>%
+  ungroup() %>%
+  select_if(!names(.) %in% remove_columns) %>%
+  select_if(is.numeric)
+
+# data_with_tfidfmatrix <- data_with_tfidfmatrix[,colSums(is.na(data_with_tfidfmatrix))<nrow(data_with_tfidfmatrix)] # remove NA columns
+
+price_model_with_tfidf <- lm(log(average_price)~., data = data_with_tfidfmatrix)
+occupancy_model_with_tfidf <- lm(occupancy_rate~., data = data_with_tfidfmatrix)
+
+summary(price_model_with_tfidf)
+
+rm(data_with_tfidfmatrix)
+```
+
+## Compare Price Models
+```{r}
+# ----- Plot the most significant variables
+head(as.data.frame(summary(price_base_model)$coefficients) %>%
+  tibble::rownames_to_column() %>%
+  mutate(`absolute t value` = abs(`t value`)) %>%
+  arrange(`Pr(>|t|)`) , 30) %>%
+  mutate(rowname=factor(rowname, levels=rowname)) %>%
+  ggplot(aes(x = rowname, y = `absolute t value`)) + geom_col() + coord_flip() + labs(title = paste(city[2],'Base price model'), caption = paste('Adjusted R-squared:', round(summary(price_base_model)$adj.r.squared,3)))
+
+
+head(as.data.frame(summary(price_model_with_tfidf)$coefficients) %>%
+  tibble::rownames_to_column() %>%
+  mutate(`absolute t value` = abs(`t value`)) %>%
+  arrange(`Pr(>|t|)`) , 30) %>%
+  mutate(rowname=factor(rowname, levels=rowname)) %>%
+  ggplot(aes(x = rowname, y = `absolute t value`)) + geom_col() + coord_flip() + labs(title = paste(city[2],'Price Model with weighted TF-IDF as features'),caption = paste('Adjusted R-squared:', round(summary(price_model_with_tfidf)$adj.r.squared,3)))
+
+
+# ----- Plot the most significant variables
+head(as.data.frame(summary(occupancy_base_model)$coefficients) %>%
+  tibble::rownames_to_column() %>%
+  mutate(`absolute t value` = abs(`t value`)) %>%
+  arrange(`Pr(>|t|)`) , 30) %>%
+  mutate(rowname=factor(rowname, levels=rowname)) %>%
+  ggplot(aes(x = rowname, y = `absolute t value`)) + geom_col() + coord_flip() + labs(title = paste(city[2],'Base occupancy rate model'), caption = paste('Adjusted R-squared:', round(summary(occupancy_base_model)$adj.r.squared,3)))
+
+
+head(as.data.frame(summary(occupancy_model_with_tfidf)$coefficients) %>%
+  tibble::rownames_to_column() %>%
+  mutate(`absolute t value` = abs(`t value`)) %>%
+  arrange(`Pr(>|t|)`) , 30) %>%
+  mutate(rowname=factor(rowname, levels=rowname)) %>%
+  ggplot(aes(x = rowname, y = `absolute t value`)) + geom_col() + coord_flip() + labs(title = paste(city[2],'Occupancy with weighted TF-IDF as features'),caption = paste('Adjusted R-squared:', round(summary(occupancy_model_with_tfidf)$adj.r.squared,3)))
+
+
+save(price_base_model, file ='price_base_model.rda')
+save(price_model_with_tfidf, file ='price_model_with_tfidf.rda')
+rm(price_base_model, price_model_with_tfidf)
+
+
+```
+
+
+```{r}
+end <- Sys.time()
+end - start
+```
+
+
+
+
+
+
